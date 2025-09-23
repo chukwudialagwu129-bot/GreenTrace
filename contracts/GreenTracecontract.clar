@@ -139,27 +139,6 @@
   )
 )
 
-;; Verify manufacturer or logistics provider (contract owner only)
-(define-public (verify-participant (participant principal) (participant-type (string-ascii 20)))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (if (is-eq participant-type "manufacturer")
-      (match (map-get? manufacturers participant)
-        manufacturer (map-set manufacturers participant (merge manufacturer {is-verified: true}))
-        ERR_NOT_FOUND
-      )
-      (if (is-eq participant-type "logistics")
-        (match (map-get? logistics-providers participant)
-          provider (map-set logistics-providers participant (merge provider {is-verified: true}))
-          ERR_NOT_FOUND
-        )
-        ERR_INVALID_PARTICIPANT
-      )
-    )
-    (ok true)
-  )
-)
-
 ;; Register product with manufacturing carbon data
 (define-public (register-product 
   (product-name (string-ascii 50))
@@ -172,10 +151,8 @@
     (caller tx-sender)
   )
     ;; Check if caller is verified manufacturer
-    (match (map-get? manufacturers caller)
-      manufacturer (asserts! (get is-verified manufacturer) ERR_NOT_AUTHORIZED)
-      ERR_NOT_AUTHORIZED
-    )
+    (asserts! (is-some (map-get? manufacturers caller)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-verified (unwrap-panic (map-get? manufacturers caller))) ERR_NOT_AUTHORIZED)
     
     ;; Check QR code not already used
     (asserts! (is-none (map-get? qr-codes qr-code-hash)) ERR_ALREADY_EXISTS)
@@ -224,10 +201,8 @@
 )
   (let ((caller tx-sender))
     ;; Check if caller is verified logistics provider
-    (match (map-get? logistics-providers caller)
-      provider (asserts! (get is-verified provider) ERR_NOT_AUTHORIZED)
-      ERR_NOT_AUTHORIZED
-    )
+    (asserts! (is-some (map-get? logistics-providers caller)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-verified (unwrap-panic (map-get? logistics-providers caller))) ERR_NOT_AUTHORIZED)
     
     ;; Check product exists
     (asserts! (is-some (map-get? products product-id)) ERR_PRODUCT_NOT_REGISTERED)
@@ -268,23 +243,24 @@
         ;; If approved, update product data
         (if approved
           (if (is-eq submission-type "manufacturing")
-            (match (map-get? products product-id)
-              product (map-set products product-id (merge product {
+            (begin
+              (asserts! (is-some (map-get? products product-id)) ERR_PRODUCT_NOT_REGISTERED)
+              (map-set products product-id (merge (unwrap-panic (map-get? products product-id)) {
                 is-verified: true
               }))
-              ERR_PRODUCT_NOT_REGISTERED
             )
             (if (is-eq submission-type "logistics")
-              (match (map-get? products product-id)
-                product (let ((new-total (+ (get manufacturing-carbon product) (get carbon-amount submission))))
+              (begin
+                (asserts! (is-some (map-get? products product-id)) ERR_PRODUCT_NOT_REGISTERED)
+                (let ((product (unwrap-panic (map-get? products product-id)))
+                      (new-total (+ (get manufacturing-carbon product) (get carbon-amount submission))))
                   (map-set products product-id (merge product {
                     logistics-carbon: (get carbon-amount submission),
                     total-carbon: new-total
                   }))
                 )
-                ERR_PRODUCT_NOT_REGISTERED
               )
-              ERR_INVALID_PARTICIPANT
+              true
             )
           )
           true

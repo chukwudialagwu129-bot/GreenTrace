@@ -7,7 +7,7 @@ cache_dir = './.cache'
 requirements = []
 [contracts.GreenTracecontract]
 path = 'contracts/GreenTracecontract.clar'
-clarity_version = 3
+clarity_version = 2
 epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
