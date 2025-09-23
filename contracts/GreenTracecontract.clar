@@ -107,3 +107,245 @@
     last-updated: uint
   }
 )
+
+
+;; public functions
+
+;; Register as manufacturer
+(define-public (register-manufacturer (name (string-ascii 50)) (certification (string-ascii 100)))
+  (let ((caller tx-sender))
+    (asserts! (is-none (map-get? manufacturers caller)) ERR_ALREADY_EXISTS)
+    (map-set manufacturers caller {
+      name: name,
+      certification: certification,
+      is-verified: false,
+      registered-at: block-height
+    })
+    (ok true)
+  )
+)
+
+;; Register as logistics provider
+(define-public (register-logistics-provider (name (string-ascii 50)) (certification (string-ascii 100)))
+  (let ((caller tx-sender))
+    (asserts! (is-none (map-get? logistics-providers caller)) ERR_ALREADY_EXISTS)
+    (map-set logistics-providers caller {
+      name: name,
+      certification: certification,
+      is-verified: false,
+      registered-at: block-height
+    })
+    (ok true)
+  )
+)
+
+;; Verify manufacturer or logistics provider (contract owner only)
+(define-public (verify-participant (participant principal) (participant-type (string-ascii 20)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (if (is-eq participant-type "manufacturer")
+      (match (map-get? manufacturers participant)
+        manufacturer (map-set manufacturers participant (merge manufacturer {is-verified: true}))
+        ERR_NOT_FOUND
+      )
+      (if (is-eq participant-type "logistics")
+        (match (map-get? logistics-providers participant)
+          provider (map-set logistics-providers participant (merge provider {is-verified: true}))
+          ERR_NOT_FOUND
+        )
+        ERR_INVALID_PARTICIPANT
+      )
+    )
+    (ok true)
+  )
+)
+
+;; Register product with manufacturing carbon data
+(define-public (register-product 
+  (product-name (string-ascii 50))
+  (manufacturing-carbon uint)
+  (qr-code-hash (buff 32))
+  (verification-data (string-ascii 200))
+)
+  (let (
+    (product-id (var-get next-product-id))
+    (caller tx-sender)
+  )
+    ;; Check if caller is verified manufacturer
+    (match (map-get? manufacturers caller)
+      manufacturer (asserts! (get is-verified manufacturer) ERR_NOT_AUTHORIZED)
+      ERR_NOT_AUTHORIZED
+    )
+    
+    ;; Check QR code not already used
+    (asserts! (is-none (map-get? qr-codes qr-code-hash)) ERR_ALREADY_EXISTS)
+    
+    ;; Submit carbon data for verification
+    (map-set carbon-submissions 
+      {submitter: caller, product-id: product-id, submission-type: "manufacturing"}
+      {
+        carbon-amount: manufacturing-carbon,
+        verification-data: verification-data,
+        submitted-at: block-height,
+        is-verified: false
+      }
+    )
+    
+    ;; Register product (initially unverified)
+    (map-set products product-id {
+      manufacturer: caller,
+      product-name: product-name,
+      manufacturing-carbon: manufacturing-carbon,
+      logistics-carbon: u0,
+      total-carbon: manufacturing-carbon,
+      qr-code-hash: qr-code-hash,
+      created-at: block-height,
+      is-verified: false
+    })
+    
+    ;; Map QR code to product
+    (map-set qr-codes qr-code-hash product-id)
+    
+    ;; Mint carbon NFT
+    (try! (nft-mint? carbon-nft product-id caller))
+    
+    ;; Increment product counter
+    (var-set next-product-id (+ product-id u1))
+    
+    (ok product-id)
+  )
+)
+
+;; Submit logistics carbon data
+(define-public (submit-logistics-carbon 
+  (product-id uint)
+  (logistics-carbon uint)
+  (verification-data (string-ascii 200))
+)
+  (let ((caller tx-sender))
+    ;; Check if caller is verified logistics provider
+    (match (map-get? logistics-providers caller)
+      provider (asserts! (get is-verified provider) ERR_NOT_AUTHORIZED)
+      ERR_NOT_AUTHORIZED
+    )
+    
+    ;; Check product exists
+    (asserts! (is-some (map-get? products product-id)) ERR_PRODUCT_NOT_REGISTERED)
+    
+    ;; Submit logistics carbon data for verification
+    (map-set carbon-submissions 
+      {submitter: caller, product-id: product-id, submission-type: "logistics"}
+      {
+        carbon-amount: logistics-carbon,
+        verification-data: verification-data,
+        submitted-at: block-height,
+        is-verified: false
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Verify carbon data submission (contract owner only)
+(define-public (verify-carbon-submission 
+  (submitter principal)
+  (product-id uint)
+  (submission-type (string-ascii 20))
+  (approved bool)
+)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    (match (map-get? carbon-submissions {submitter: submitter, product-id: product-id, submission-type: submission-type})
+      submission (begin
+        ;; Update submission verification status
+        (map-set carbon-submissions 
+          {submitter: submitter, product-id: product-id, submission-type: submission-type}
+          (merge submission {is-verified: approved})
+        )
+        
+        ;; If approved, update product data
+        (if approved
+          (if (is-eq submission-type "manufacturing")
+            (match (map-get? products product-id)
+              product (map-set products product-id (merge product {
+                is-verified: true
+              }))
+              ERR_PRODUCT_NOT_REGISTERED
+            )
+            (if (is-eq submission-type "logistics")
+              (match (map-get? products product-id)
+                product (let ((new-total (+ (get manufacturing-carbon product) (get carbon-amount submission))))
+                  (map-set products product-id (merge product {
+                    logistics-carbon: (get carbon-amount submission),
+                    total-carbon: new-total
+                  }))
+                )
+                ERR_PRODUCT_NOT_REGISTERED
+              )
+              ERR_INVALID_PARTICIPANT
+            )
+          )
+          true
+        )
+        
+        (ok approved)
+      )
+      ERR_NOT_FOUND
+    )
+  )
+)
+
+;; Set consumer carbon budget
+(define-public (set-carbon-budget (monthly-budget uint))
+  (let ((caller tx-sender))
+    (map-set consumer-budgets caller {
+      monthly-budget: monthly-budget,
+      current-usage: u0,
+      last-reset: block-height,
+      total-offsets-purchased: u0
+    })
+    (ok true)
+  )
+)
+
+;; Record consumer purchase (updates carbon usage)
+(define-public (record-consumer-purchase (product-id uint))
+  (let (
+    (caller tx-sender)
+    (current-height block-height)
+  )
+    (match (map-get? products product-id)
+      product (begin
+        (asserts! (get is-verified product) ERR_CARBON_DATA_NOT_VERIFIED)
+        
+        (match (map-get? consumer-budgets caller)
+          budget (let (
+            (blocks-since-reset (- current-height (get last-reset budget)))
+            (should-reset (>= blocks-since-reset u4320)) ;; ~30 days in blocks
+            (current-usage (if should-reset u0 (get current-usage budget)))
+            (new-usage (+ current-usage (get total-carbon product)))
+          )
+            (map-set consumer-budgets caller (merge budget {
+              current-usage: new-usage,
+              last-reset: (if should-reset current-height (get last-reset budget))
+            }))
+            (ok (get total-carbon product))
+          )
+          ;; Create budget if doesn't exist
+          (begin
+            (map-set consumer-budgets caller {
+              monthly-budget: u10000, ;; Default 10kg CO2 monthly budget
+              current-usage: (get total-carbon product),
+              last-reset: current-height,
+              total-offsets-purchased: u0
+            })
+            (ok (get total-carbon product))
+          )
+        )
+      )
+      ERR_PRODUCT_NOT_REGISTERED
+    )
+  )
+)
