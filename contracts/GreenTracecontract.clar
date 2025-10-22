@@ -26,11 +26,20 @@
 (define-constant ERR_INVALID_PARTICIPANT (err u403))
 (define-constant ERR_PRODUCT_NOT_REGISTERED (err u405))
 (define-constant ERR_CARBON_DATA_NOT_VERIFIED (err u406))
+(define-constant ERR_CONTRACT_PAUSED (err u407))
+(define-constant ERR_RATE_LIMIT_EXCEEDED (err u408))
+(define-constant ERR_OVERFLOW (err u409))
+(define-constant ERR_INVALID_INPUT (err u410))
+(define-constant ERR_UNDERFLOW (err u411))
 
 ;; data vars
 (define-data-var next-product-id uint u1)
 (define-data-var total-carbon-credits uint u0)
 (define-data-var carbon-credit-price uint u1000000) ;; 1 STX per credit
+(define-data-var contract-paused bool false)
+
+(define-constant RATE-LIMIT-BLOCKS u10)
+(define-constant MAX-OPERATIONS-PER-BLOCK u5)
 
 ;; data maps
 ;; Manufacturer registration
@@ -108,12 +117,89 @@
   }
 )
 
+(define-map last-operation-block principal uint)
+(define-map operations-per-block {user: principal, block: uint} uint)
+
+;; Security helper functions
+(define-private (check-not-paused)
+  (if (var-get contract-paused)
+    ERR_CONTRACT_PAUSED
+    (ok true)
+  )
+)
+
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) ERR_OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) ERR_OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b)
+    (ok (- a b))
+    ERR_UNDERFLOW
+  )
+)
+
+(define-private (check-rate-limit (user principal))
+  (let (
+    (current-block block-height)
+    (last-block (default-to u0 (map-get? last-operation-block user)))
+    (ops-count (default-to u0 (map-get? operations-per-block {user: user, block: current-block})))
+  )
+    (asserts! 
+      (or 
+        (>= (- current-block last-block) RATE-LIMIT-BLOCKS)
+        (< ops-count MAX-OPERATIONS-PER-BLOCK)
+      )
+      ERR_RATE_LIMIT_EXCEEDED
+    )
+    (map-set last-operation-block user current-block)
+    (map-set operations-per-block {user: user, block: current-block} (+ ops-count u1))
+    (ok true)
+  )
+)
+
+(define-private (validate-string-not-empty (str (string-ascii 50)))
+  (if (> (len str) u0)
+    (ok true)
+    ERR_INVALID_INPUT
+  )
+)
 
 ;; public functions
+
+;; Pause/unpause contract (owner only)
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
 
 ;; Register as manufacturer
 (define-public (register-manufacturer (name (string-ascii 50)) (certification (string-ascii 100)))
   (let ((caller tx-sender))
+    (try! (check-not-paused))
+    (try! (check-rate-limit caller))
+    (try! (validate-string-not-empty name))
     (asserts! (is-none (map-get? manufacturers caller)) ERR_ALREADY_EXISTS)
     (map-set manufacturers caller {
       name: name,
@@ -128,6 +214,9 @@
 ;; Register as logistics provider
 (define-public (register-logistics-provider (name (string-ascii 50)) (certification (string-ascii 100)))
   (let ((caller tx-sender))
+    (try! (check-not-paused))
+    (try! (check-rate-limit caller))
+    (try! (validate-string-not-empty name))
     (asserts! (is-none (map-get? logistics-providers caller)) ERR_ALREADY_EXISTS)
     (map-set logistics-providers caller {
       name: name,
@@ -150,6 +239,11 @@
     (product-id (var-get next-product-id))
     (caller tx-sender)
   )
+    (try! (check-not-paused))
+    (try! (check-rate-limit caller))
+    (try! (validate-string-not-empty product-name))
+    (asserts! (> manufacturing-carbon u0) ERR_INVALID_AMOUNT)
+    
     ;; Check if caller is verified manufacturer
     (asserts! (is-some (map-get? manufacturers caller)) ERR_NOT_AUTHORIZED)
     (asserts! (get is-verified (unwrap-panic (map-get? manufacturers caller))) ERR_NOT_AUTHORIZED)
@@ -187,7 +281,7 @@
     (try! (nft-mint? carbon-nft product-id caller))
     
     ;; Increment product counter
-    (var-set next-product-id (+ product-id u1))
+    (var-set next-product-id (unwrap! (safe-add product-id u1) ERR_OVERFLOW))
     
     (ok product-id)
   )
@@ -200,6 +294,10 @@
   (verification-data (string-ascii 200))
 )
   (let ((caller tx-sender))
+    (try! (check-not-paused))
+    (try! (check-rate-limit caller))
+    (asserts! (> logistics-carbon u0) ERR_INVALID_AMOUNT)
+    
     ;; Check if caller is verified logistics provider
     (asserts! (is-some (map-get? logistics-providers caller)) ERR_NOT_AUTHORIZED)
     (asserts! (get is-verified (unwrap-panic (map-get? logistics-providers caller))) ERR_NOT_AUTHORIZED)
@@ -276,6 +374,8 @@
 ;; Set consumer carbon budget
 (define-public (set-carbon-budget (monthly-budget uint))
   (let ((caller tx-sender))
+    (try! (check-not-paused))
+    (asserts! (> monthly-budget u0) ERR_INVALID_AMOUNT)
     (map-set consumer-budgets caller {
       monthly-budget: monthly-budget,
       current-usage: u0,
@@ -331,23 +431,22 @@
 (define-public (purchase-carbon-offsets (amount uint))
   (let (
     (caller tx-sender)
-    (cost (* amount (var-get carbon-credit-price)))
+    (cost (unwrap! (safe-mul amount (var-get carbon-credit-price)) ERR_OVERFLOW))
   )
+    (try! (check-not-paused))
+    (try! (check-rate-limit caller))
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
     
-    ;; Transfer STX for carbon credits
-    (try! (stx-transfer? cost caller CONTRACT_OWNER))
-    
-    ;; Mint carbon credits to user
+    ;; Mint carbon credits to user BEFORE transfer (reentrancy protection)
     (try! (ft-mint? carbon-credit amount caller))
     
     ;; Update total credits issued
-    (var-set total-carbon-credits (+ (var-get total-carbon-credits) amount))
+    (var-set total-carbon-credits (unwrap! (safe-add (var-get total-carbon-credits) amount) ERR_OVERFLOW))
     
     ;; Update consumer's offset purchase record
     (match (map-get? consumer-budgets caller)
       budget (map-set consumer-budgets caller (merge budget {
-        total-offsets-purchased: (+ (get total-offsets-purchased budget) amount)
+        total-offsets-purchased: (unwrap! (safe-add (get total-offsets-purchased budget) amount) ERR_OVERFLOW)
       }))
       ;; Create budget record if doesn't exist
       (map-set consumer-budgets caller {
@@ -358,6 +457,9 @@
       })
     )
     
+    ;; Transfer STX for carbon credits AFTER state updates (reentrancy protection)
+    (try! (stx-transfer? cost caller CONTRACT_OWNER))
+    
     (ok amount)
   )
 )
@@ -365,6 +467,9 @@
 ;; Update retailer disclosure
 (define-public (update-retailer-disclosure (total-products uint) (average-carbon uint))
   (let ((caller tx-sender))
+    (try! (check-not-paused))
+    (asserts! (> total-products u0) ERR_INVALID_AMOUNT)
+    (asserts! (> average-carbon u0) ERR_INVALID_AMOUNT)
     (map-set retailer-disclosures caller {
       total-products: total-products,
       average-carbon-footprint: average-carbon,
@@ -440,6 +545,29 @@
 ;; Get consumer carbon credit balance
 (define-read-only (get-carbon-credit-balance (account principal))
   (ft-get-balance carbon-credit account)
+)
+
+;; Security read-only functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user))
+)
+
+(define-read-only (is-manufacturer-verified (manufacturer principal))
+  (match (map-get? manufacturers manufacturer)
+    mfr (get is-verified mfr)
+    false
+  )
+)
+
+(define-read-only (is-logistics-verified (provider principal))
+  (match (map-get? logistics-providers provider)
+    prov (get is-verified prov)
+    false
+  )
 )
 
 ;; private functions
