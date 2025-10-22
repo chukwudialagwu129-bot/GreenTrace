@@ -139,27 +139,6 @@
   )
 )
 
-;; Verify manufacturer or logistics provider (contract owner only)
-(define-public (verify-participant (participant principal) (participant-type (string-ascii 20)))
-  (begin
-    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
-    (if (is-eq participant-type "manufacturer")
-      (match (map-get? manufacturers participant)
-        manufacturer (map-set manufacturers participant (merge manufacturer {is-verified: true}))
-        ERR_NOT_FOUND
-      )
-      (if (is-eq participant-type "logistics")
-        (match (map-get? logistics-providers participant)
-          provider (map-set logistics-providers participant (merge provider {is-verified: true}))
-          ERR_NOT_FOUND
-        )
-        ERR_INVALID_PARTICIPANT
-      )
-    )
-    (ok true)
-  )
-)
-
 ;; Register product with manufacturing carbon data
 (define-public (register-product 
   (product-name (string-ascii 50))
@@ -172,10 +151,8 @@
     (caller tx-sender)
   )
     ;; Check if caller is verified manufacturer
-    (match (map-get? manufacturers caller)
-      manufacturer (asserts! (get is-verified manufacturer) ERR_NOT_AUTHORIZED)
-      ERR_NOT_AUTHORIZED
-    )
+    (asserts! (is-some (map-get? manufacturers caller)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-verified (unwrap-panic (map-get? manufacturers caller))) ERR_NOT_AUTHORIZED)
     
     ;; Check QR code not already used
     (asserts! (is-none (map-get? qr-codes qr-code-hash)) ERR_ALREADY_EXISTS)
@@ -224,10 +201,8 @@
 )
   (let ((caller tx-sender))
     ;; Check if caller is verified logistics provider
-    (match (map-get? logistics-providers caller)
-      provider (asserts! (get is-verified provider) ERR_NOT_AUTHORIZED)
-      ERR_NOT_AUTHORIZED
-    )
+    (asserts! (is-some (map-get? logistics-providers caller)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-verified (unwrap-panic (map-get? logistics-providers caller))) ERR_NOT_AUTHORIZED)
     
     ;; Check product exists
     (asserts! (is-some (map-get? products product-id)) ERR_PRODUCT_NOT_REGISTERED)
@@ -268,23 +243,24 @@
         ;; If approved, update product data
         (if approved
           (if (is-eq submission-type "manufacturing")
-            (match (map-get? products product-id)
-              product (map-set products product-id (merge product {
+            (begin
+              (asserts! (is-some (map-get? products product-id)) ERR_PRODUCT_NOT_REGISTERED)
+              (map-set products product-id (merge (unwrap-panic (map-get? products product-id)) {
                 is-verified: true
               }))
-              ERR_PRODUCT_NOT_REGISTERED
             )
             (if (is-eq submission-type "logistics")
-              (match (map-get? products product-id)
-                product (let ((new-total (+ (get manufacturing-carbon product) (get carbon-amount submission))))
+              (begin
+                (asserts! (is-some (map-get? products product-id)) ERR_PRODUCT_NOT_REGISTERED)
+                (let ((product (unwrap-panic (map-get? products product-id)))
+                      (new-total (+ (get manufacturing-carbon product) (get carbon-amount submission))))
                   (map-set products product-id (merge product {
                     logistics-carbon: (get carbon-amount submission),
                     total-carbon: new-total
                   }))
                 )
-                ERR_PRODUCT_NOT_REGISTERED
               )
-              ERR_INVALID_PARTICIPANT
+              true
             )
           )
           true
@@ -346,6 +322,146 @@
         )
       )
       ERR_PRODUCT_NOT_REGISTERED
+    )
+  )
+)
+
+
+;; Purchase carbon offsets
+(define-public (purchase-carbon-offsets (amount uint))
+  (let (
+    (caller tx-sender)
+    (cost (* amount (var-get carbon-credit-price)))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    ;; Transfer STX for carbon credits
+    (try! (stx-transfer? cost caller CONTRACT_OWNER))
+    
+    ;; Mint carbon credits to user
+    (try! (ft-mint? carbon-credit amount caller))
+    
+    ;; Update total credits issued
+    (var-set total-carbon-credits (+ (var-get total-carbon-credits) amount))
+    
+    ;; Update consumer's offset purchase record
+    (match (map-get? consumer-budgets caller)
+      budget (map-set consumer-budgets caller (merge budget {
+        total-offsets-purchased: (+ (get total-offsets-purchased budget) amount)
+      }))
+      ;; Create budget record if doesn't exist
+      (map-set consumer-budgets caller {
+        monthly-budget: u10000,
+        current-usage: u0,
+        last-reset: block-height,
+        total-offsets-purchased: amount
+      })
+    )
+    
+    (ok amount)
+  )
+)
+
+;; Update retailer disclosure
+(define-public (update-retailer-disclosure (total-products uint) (average-carbon uint))
+  (let ((caller tx-sender))
+    (map-set retailer-disclosures caller {
+      total-products: total-products,
+      average-carbon-footprint: average-carbon,
+      last-updated: block-height
+    })
+    (ok true)
+  )
+)
+
+;; read only functions
+
+;; Get product carbon footprint by QR code
+(define-read-only (get-product-by-qr (qr-code-hash (buff 32)))
+  (match (map-get? qr-codes qr-code-hash)
+    product-id (map-get? products product-id)
+    none
+  )
+)
+
+;; Get product carbon footprint by ID
+(define-read-only (get-product (product-id uint))
+  (map-get? products product-id)
+)
+
+;; Get manufacturer info
+(define-read-only (get-manufacturer (manufacturer principal))
+  (map-get? manufacturers manufacturer)
+)
+
+;; Get logistics provider info
+(define-read-only (get-logistics-provider (provider principal))
+  (map-get? logistics-providers provider)
+)
+
+;; Get consumer carbon budget
+(define-read-only (get-consumer-budget (consumer principal))
+  (map-get? consumer-budgets consumer)
+)
+
+;; Get carbon submission status
+(define-read-only (get-carbon-submission (submitter principal) (product-id uint) (submission-type (string-ascii 20)))
+  (map-get? carbon-submissions {submitter: submitter, product-id: product-id, submission-type: submission-type})
+)
+
+;; Get retailer disclosure
+(define-read-only (get-retailer-disclosure (retailer principal))
+  (map-get? retailer-disclosures retailer)
+)
+
+;; Check if consumer is within carbon budget
+(define-read-only (check-carbon-budget (consumer principal))
+  (match (map-get? consumer-budgets consumer)
+    budget (ok (<= (get current-usage budget) (get monthly-budget budget)))
+    (ok true) ;; No budget set means no restrictions
+  )
+)
+
+;; Get carbon credit price
+(define-read-only (get-carbon-credit-price)
+  (var-get carbon-credit-price)
+)
+
+;; Get total carbon credits issued
+(define-read-only (get-total-carbon-credits)
+  (var-get total-carbon-credits)
+)
+
+;; Get NFT owner
+(define-read-only (get-nft-owner (product-id uint))
+  (nft-get-owner? carbon-nft product-id)
+)
+
+;; Get consumer carbon credit balance
+(define-read-only (get-carbon-credit-balance (account principal))
+  (ft-get-balance carbon-credit account)
+)
+
+;; private functions
+
+;; Calculate total carbon footprint
+(define-private (calculate-total-carbon (manufacturing uint) (logistics uint))
+  (+ manufacturing logistics)
+)
+
+;; Check if participant is verified
+(define-private (is-participant-verified (participant principal) (participant-type (string-ascii 20)))
+  (if (is-eq participant-type "manufacturer")
+    (match (map-get? manufacturers participant)
+      manufacturer (get is-verified manufacturer)
+      false
+    )
+    (if (is-eq participant-type "logistics")
+      (match (map-get? logistics-providers participant)
+        provider (get is-verified provider)
+        false
+      )
+      false
     )
   )
 )
